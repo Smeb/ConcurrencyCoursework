@@ -52,6 +52,8 @@ public class Main {
         DataFrame myMessage = new DataFrame("Hello World");
         System.out.println("SENDING DATA FRAME: " + myMessage);
         networkCardA.send(myMessage);
+        networkCardA.send(new DataFrame("A Whole new world"));
+        networkCardB.send(new DataFrame("A bright fantastic point of view"));
         
     }
 }

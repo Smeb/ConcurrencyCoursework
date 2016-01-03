@@ -8,6 +8,7 @@ import java.util.LinkedList;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  *
@@ -35,13 +36,18 @@ public class NetworkCard extends Thread {
 
     // A 'data frame listener' to call if a data frame is received.
     private final FrameListener listener;
+
+    // Auxilary data structures to manage scheduling
     private final LinkedBlockingQueue<Double> voltageQueue;
     private final LinkedList<Byte> byteQueue;
+    private final ScheduledFrame scheduledFrame;
 
     // Default values for high, low and mid- voltages on the wire.
     private final static double HIGH_VOLTAGE = 2.5;
     private final static double LOW_VOLTAGE = -2.5;
     private final static double ACC_V_DEVIANCE = 0.5;
+    private final AtomicInteger bitCount;
+    private CountDownLatch countDownLatch;
 
     // Default value for a signal pulse width that should be used in milliseconds.
     private final static int PULSE_WIDTH = 200;
@@ -52,13 +58,11 @@ public class NetworkCard extends Thread {
     // Default value for maximum payload size in bytes.
     private final static int MAX_PAYLOAD_SIZE = 1500;
 
-    private final Semaphore semaphore;
+    // Substitute names for voltage signals used in helper methods
     private final boolean UP = true;
     private final boolean DOWN = false;
-
     private boolean IN_FRAME;
     private byte lastByte = 0x00;
-    private final AtomicInteger bitCount;
 
     /**
      * NetworkCard constructor.
@@ -73,9 +77,9 @@ public class NetworkCard extends Thread {
         this.byteQueue = new LinkedList<>();
         this.deviceName = deviceName;
         this.listener = listener;
-        this.semaphore = new Semaphore(1);
         this.voltageQueue = new LinkedBlockingQueue<Double>();
         this.wire = wire;
+        this.scheduledFrame = new ScheduledFrame();
     }
 
     /**
@@ -85,12 +89,10 @@ public class NetworkCard extends Thread {
      * @param frame Data frame to send across the network.
      */
     public void send(DataFrame frame) throws InterruptedException {
-        // Scheduled frame manages the timing of each byte transmission by scheduling transmissions according
-        // to the pulse width
-
-        if (frame != null) {
-            new scheduledFrame(frame.getPayload());
-        }
+        countDownLatch = new CountDownLatch(1);
+        scheduledFrame.addPayload(frame.getPayload());
+        countDownLatch.await();
+        System.out.println("Woke up");
     }
 
     /*
@@ -103,27 +105,34 @@ public class NetworkCard extends Thread {
         if (listener != null) {
             ScheduledExecutorService executor = Executors.newScheduledThreadPool(2);
 
-            executor.scheduleAtFixedRate(new byteEvaluator(), 0, PULSE_WIDTH * 8, TimeUnit.MILLISECONDS);
-            executor.scheduleAtFixedRate(new wireMonitor(), 0, PULSE_WIDTH / SAMPLE_RATE, TimeUnit.MILLISECONDS);
+            executor.scheduleAtFixedRate(new ByteEvaluator(), 0, PULSE_WIDTH * 8, TimeUnit.MILLISECONDS);
+            executor.scheduleAtFixedRate(new WireMonitor(), 0, PULSE_WIDTH / SAMPLE_RATE, TimeUnit.MILLISECONDS);
         }
     }
 
     // Sender tasks
 
-    private class scheduledFrame {
+    private class ScheduledFrame {
         private final AtomicInteger runCount = new AtomicInteger(0);
-        private final byteManager byteMngr;
-        private final LinkedList<Byte> payload;
+        private final ByteManager byteMngr;
+        private final ConcurrentLinkedQueue<Byte> payload;
         private final ScheduledExecutorService executor;
-        private final ScheduledFuture<?> future;
         private byte workingByte;
 
-        public scheduledFrame(byte[] payload) {
-            this.payload = new LinkedList<Byte>();
+        public ScheduledFrame() {
+            byteMngr = new ByteManager();
+            executor = Executors.newScheduledThreadPool(1);
+            executor.scheduleAtFixedRate(byteMngr, 0, PULSE_WIDTH, TimeUnit.MILLISECONDS);
+            this.payload = new ConcurrentLinkedQueue<Byte>();
+        }
+
+        // This doesn't actually need to be synchronized because of the requirement that the send
+        // method of NetworkCard returns only after the DataFrame has been sent.
+
+        synchronized void addPayload(byte[] payload){
             for(int i = 0; i < 5; i++){
                 this.payload.add((byte)0x00);
             }
-
             this.payload.add(SEQUENCE_CHAR);
             for (byte b : payload) {
                 if (b == SEQUENCE_CHAR || b == ESCAPE_CHAR) {
@@ -132,32 +141,31 @@ public class NetworkCard extends Thread {
                 this.payload.add(b);
             }
             this.payload.add(SEQUENCE_CHAR);
-
-            byteMngr = new byteManager();
-            executor = Executors.newScheduledThreadPool(1);
-            future = executor.scheduleAtFixedRate(byteMngr, 0, PULSE_WIDTH, TimeUnit.MILLISECONDS);
         }
 
-
-        private class byteManager implements Runnable {
-
+        private class ByteManager implements Runnable {
             public void run() {
-                if (runCount.get() == 0) {
-                    workingByte = payload.getFirst();
-                }
-                if ((workingByte & 0x80) == 0x80) {
-                    wire.setVoltage(deviceName, HIGH_VOLTAGE);
-                } else {
-                    wire.setVoltage(deviceName, LOW_VOLTAGE);
-                }
-                workingByte <<= 1;
-                runCount.incrementAndGet();
-                if (runCount.get() == 8) {
-                    if (payload.isEmpty()) {
-                        future.cancel(true);
+                if(!payload.isEmpty()) {
+                    if (runCount.get() == 0) {
+                        workingByte = payload.element();
                     }
-                    runCount.set(0);
-                    payload.removeFirst();
+                    if ((workingByte & 0x80) == 0x80) {
+                        wire.setVoltage(deviceName, HIGH_VOLTAGE);
+                    } else {
+                        wire.setVoltage(deviceName, LOW_VOLTAGE);
+                    }
+                    workingByte <<= 1;
+                    runCount.incrementAndGet();
+                    if (runCount.get() == 8) {
+                        runCount.set(0);
+                        payload.remove();
+                    }
+                }
+                else{
+                    if(countDownLatch != null){
+                        wire.setVoltage(deviceName, 0);
+                        countDownLatch.countDown();
+                    }
                 }
             }
         }
@@ -165,7 +173,7 @@ public class NetworkCard extends Thread {
 
     // Receiver tasks
 
-    private class wireMonitor implements Runnable {
+    private class WireMonitor implements Runnable {
         public void run() {
             try {
                 voltageQueue.put(wire.getVoltage(deviceName));
@@ -175,7 +183,7 @@ public class NetworkCard extends Thread {
         }
     }
 
-    private class byteEvaluator implements Runnable {
+    private class ByteEvaluator implements Runnable {
         private boolean byteStuffFlag = false;
 
         public void run() {
@@ -210,7 +218,7 @@ public class NetworkCard extends Thread {
                                 byteStuffFlag = true;
                             }
                             else{
-                                byteQueue.add(new Byte(lastByte));
+                                byteQueue.add(lastByte);
                             }
                             bitCount.set(0);
                         } else {
